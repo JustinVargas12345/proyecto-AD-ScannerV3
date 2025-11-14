@@ -1,5 +1,6 @@
 
-# ad_utils.py
+
+
 import socket
 import subprocess
 import platform
@@ -7,26 +8,40 @@ import time
 from datetime import datetime
 from ldap3 import Server, Connection, ALL
 from db_conexion import conectar_sql
-from config_json_loader import cargar_config
-from logs_utils import escribir_log 
-
-
-config = cargar_config()
-PING_INTERVAL = config["PING_INTERVAL"]
-AD_SERVER = config["AD_SERVER"]
-AD_USER = config["AD_USER"]
-AD_PASSWORD = config["AD_PASSWORD"]
-AD_SEARCH_BASE = config["AD_SEARCH_BASE"]
+from logs_utils import escribir_log
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 estado_ping = {}
 
-def obtener_equipos_ad():
+# ------------------------
+# Validar credenciales AD
+# ------------------------
+def validar_ad(config):
+    """
+    Valida credenciales de AD usando los valores actuales del config.
+    """
+    try:
+        server = Server(config["AD_SERVER"], get_info=ALL)
+        conn = Connection(server, user=config["AD_USER"], password=config["AD_PASSWORD"], auto_bind=True)
+        conn.unbind()
+        return True
+    except Exception as e:
+        escribir_log(f"Excepción al validar AD: {e}", tipo="ERROR")
+        return False
+
+# ------------------------
+# Obtener equipos desde AD
+# ------------------------
+def obtener_equipos_ad(config):
+    """
+    Obtiene los equipos de AD usando las credenciales actuales.
+    """
     equipos = []
     try:
-        server = Server(AD_SERVER, get_info=ALL)
-        conn = Connection(server, user=AD_USER, password=AD_PASSWORD, auto_bind=True)
+        server = Server(config["AD_SERVER"], get_info=ALL)
+        conn = Connection(server, user=config["AD_USER"], password=config["AD_PASSWORD"], auto_bind=True)
         conn.search(
-            AD_SEARCH_BASE,
+            config["AD_SEARCH_BASE"],
             "(objectClass=computer)",
             attributes=[
                 "name", "dNSHostName", "operatingSystem", "operatingSystemVersion",
@@ -64,33 +79,27 @@ def obtener_equipos_ad():
                 "ubicacion": ubicacion,
                 "estadocuenta": estado_cuenta
             })
-        print(f"[OK] Equipos obtenidos desde AD: {len(equipos)} encontrados.")
+
+        escribir_log(f"Equipos obtenidos desde AD: {len(equipos)}", tipo="INFO")
+
     except Exception as e:
-        print("[ERROR] Excepción al leer AD:", e)
+        escribir_log(f"Excepción al leer AD: {e}", tipo="ERROR")
+
     return equipos
 
-
-
-'''
-def hacer_ping(host):
-    try:
-        param = "-n" if platform.system().lower() == "windows" else "-c"
-        result = subprocess.run(["ping", param, "1", host], capture_output=True, timeout=6)
-        return "Activo" if result.returncode == 0 else "Inactivo"
-    except subprocess.TimeoutExpired:
-        return "Timeout"
-    except Exception:
-        return "Error"
-'''
-
+# ------------------------
+# Función de ping
+# ------------------------
 def hacer_ping(host):
     try:
         param = "-n" if platform.system().lower() == "windows" else "-c"
         result = subprocess.run(["ping", param, "1", host], capture_output=True, timeout=6)
         estado = "Activo" if result.returncode == 0 else "Inactivo"
+
         if estado != "Activo":
             escribir_log(f"Ping fallido: {host} → {estado}", tipo="WARNING")
         return estado
+
     except subprocess.TimeoutExpired:
         escribir_log(f"Ping timeout: {host}", tipo="ERROR")
         return "Timeout"
@@ -98,14 +107,9 @@ def hacer_ping(host):
         escribir_log(f"Error en ping {host}: {e}", tipo="ERROR")
         return "Error"
 
-
-
-
-
-
-
-
-
+# ------------------------
+# Ejecutar SQL con reintento
+# ------------------------
 def ejecutar_sql_reintento(conn, query, params=(), reintentos=3, espera=5):
     for intento in range(1, reintentos + 1):
         try:
@@ -114,52 +118,55 @@ def ejecutar_sql_reintento(conn, query, params=(), reintentos=3, espera=5):
             conn.commit()
             return True
         except Exception as e:
-            print(f"[ERROR] SQL intento {intento}: {e}")
             escribir_log(f"SQL intento {intento} fallido: {e}", tipo="ERROR")
             if intento < reintentos:
-                print(f"  Reintentando en {espera} segundos...")
                 time.sleep(espera)
-                conn = conectar_sql()  # reconectar
+                conn = conectar_sql()
             else:
-                print("[FATAL] No se pudo ejecutar la operación SQL.")
                 return False
-      
-            
 
-def insertar_o_actualizar(conn, equipos, equipos_ad_actuales):
-    for eq in equipos:
+# ------------------------
+# Insertar o actualizar equipos con multithreading para ping
+# ------------------------
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Lock global para acceso a SQL
+sql_lock = Lock()
+
+def insertar_o_actualizar(conn, equipos, equipos_ad_actuales, ping_interval, max_threads=10):
+    """
+    Inserta o actualiza los registros de AD en la base de datos.
+    Los pings se hacen en paralelo, pero las consultas SQL se serializan usando un lock.
+    """
+    def procesar_equipo(eq):
         ping = hacer_ping(eq["nombre"])
         estado_ad = "Dentro de AD" if eq["nombre"] in equipos_ad_actuales else "Removido de AD"
 
+        # Actualizar estado_ping
         if eq["nombre"] in estado_ping:
             anterior = estado_ping[eq["nombre"]]["estado"]
-            if anterior == ping:
-                estado_ping[eq["nombre"]]["contador"] += 1
-            else:
+            if anterior != ping:
                 escribir_log(f"Estado de {eq['nombre']} cambió de {anterior} a {ping}")
                 estado_ping[eq["nombre"]]["estado"] = ping
                 estado_ping[eq["nombre"]]["contador"] = 1
-
-            if ping in ("Inactivo", "Timeout", "Error"):
-                if not estado_ping[eq["nombre"]].get("inactivo_desde"):
-                    estado_ping[eq["nombre"]]["inactivo_desde"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             else:
-                estado_ping[eq["nombre"]]["inactivo_desde"] = None
+                estado_ping[eq["nombre"]]["contador"] += 1
         else:
-            estado_ping[eq["nombre"]] = {
-                "estado": ping,
-                "contador": 1,
-                "inactivo_desde": datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                if ping in ("Inactivo", "Timeout", "Error") else None
-            }
+            estado_ping[eq["nombre"]] = {"estado": ping, "contador": 1}
 
-        tiempo_total_segundos = estado_ping[eq["nombre"]]["contador"] * PING_INTERVAL
+        inactivo_desde = estado_ping[eq["nombre"]].get("inactivo_desde")
+        if ping in ("Inactivo", "Timeout", "Error"):
+            if not inactivo_desde:
+                estado_ping[eq["nombre"]]["inactivo_desde"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        else:
+            estado_ping[eq["nombre"]]["inactivo_desde"] = None
+
+        tiempo_total_segundos = estado_ping[eq["nombre"]]["contador"] * ping_interval
         horas = tiempo_total_segundos // 3600
         minutos = (tiempo_total_segundos % 3600) // 60
         segundos = tiempo_total_segundos % 60
         tiempo_formateado = f"{horas:02}:{minutos:02}:{segundos:02}"
-
-        inactivo_desde = estado_ping[eq["nombre"]]["inactivo_desde"]
 
         query = """
             MERGE EquiposAD AS target
@@ -193,11 +200,21 @@ def insertar_o_actualizar(conn, equipos, equipos_ad_actuales):
                         src.Ubicacion, src.EstadoCuenta, src.PingStatus, src.TiempoPing,
                         src.InactivoDesde, src.EstadoAD);
         """
-        ejecutar_sql_reintento(conn, query, (
-            eq["nombre"], eq["so"], eq["descripcion"], eq["ip"], eq["nombredns"],
-            eq["versionso"], eq["creadoel"], eq["ultimologon"], eq["responsable"],
-            eq["ubicacion"], eq["estadocuenta"], ping, tiempo_formateado, inactivo_desde, estado_ad
-        ))
 
-        texto_fecha = f" | Inactivo desde: {inactivo_desde}" if inactivo_desde else ""
+        # Serializamos la ejecución SQL usando el lock
+        with sql_lock:
+            ejecutar_sql_reintento(conn, query, (
+                eq["nombre"], eq["so"], eq["descripcion"], eq["ip"], eq["nombredns"],
+                eq["versionso"], eq["creadoel"], eq["ultimologon"], eq["responsable"],
+                eq["ubicacion"], eq["estadocuenta"], ping, tiempo_formateado,
+                estado_ping[eq["nombre"]]["inactivo_desde"], estado_ad
+            ))
+
+        texto_fecha = f" | Inactivo desde: {estado_ping[eq['nombre']].get('inactivo_desde')}" if estado_ping[eq["nombre"]].get('inactivo_desde') else ""
         print(f"[PING] {eq['nombre']} ({eq['ip']}) → {ping} | {estado_ad} ({tiempo_formateado}){texto_fecha}")
+
+    # Ejecutar pings en paralelo
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        futures = [executor.submit(procesar_equipo, eq) for eq in equipos]
+        for _ in as_completed(futures):
+            pass

@@ -1,7 +1,8 @@
+'''
 import json
 import os
 
-def cargar_config(config_file="config.json"):
+def cargar_config(config_file="Config.json"):
     """
     Carga el archivo config.json y devuelve los valores en forma de diccionario.
     Si el archivo no existe o tiene errores, lanza una excepción.
@@ -22,3 +23,4 @@ def cargar_config(config_file="config.json"):
         raise ValueError(f"[ERROR] El archivo JSON está mal formado: {e}")
     except Exception as e:
         raise ValueError(f"[ERROR] No se pudieron leer los valores del archivo JSON: {e}")
+'''
