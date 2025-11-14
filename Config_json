@@ -1,0 +1,13 @@
+{
+  "PING_INTERVAL": "25",
+  "AD_SERVER": "DC.lab.local",
+  "AD_USER": "administrador.lab.local",
+  "AD_PASSWORD": "Laboratorio",
+  "AD_SEARCH_BASE": "DC=lab,DC=local",
+  "DB_DRIVER": "{ODBC Driver 17 for SQL Server}",
+  "DB_SERVER": ".\\SQLEXPRESS",
+  "DB_NAME": "DbAlgoritmo",
+  "DB_TRUSTED": "yes",
+  "DB_USER": null,
+  "DB_PASSWORD": null
+}
